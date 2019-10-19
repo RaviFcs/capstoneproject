@@ -1,0 +1,566 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Metadata:
+  License: Apache-2.0
+Description: 'AWS CloudFormation template for creating ECS Cluster, DB creation which helps in deploying the ecommerce application end to end with no human intervention for creating the resources manually.'
+Parameters:
+  DBName:
+    Default: dbproduct
+    Type: String
+  DBUser:
+    NoEcho: 'true'
+    Description: The database admin account username
+    Type: String
+    Default: root
+  DBPassword:
+    NoEcho: 'true'
+    Description: The database admin account password
+    Type: String
+    Default: password
+  DBAllocatedStorage:
+    Default: '20'
+    Description: The size of the database (Gb)
+    Type: Number
+    MinValue: '20'
+    MaxValue: '1024'
+    ConstraintDescription: must be between 5 and 1024Gb.
+  DBInstanceClass:
+    Description: The database instance type
+    Type: String
+    Default: db.t2.micro
+Mappings:
+  SubnetConfig:
+    VPC:
+      CIDR: '10.0.0.0/16'
+    SubnetOne:
+      CIDR: '10.0.0.0/24'
+    SubnetTwo:
+      CIDR: '10.0.1.0/24'
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      CidrBlock: !FindInMap ['SubnetConfig', 'VPC', 'CIDR']
+  SubnetOne:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref 'VPC'
+      CidrBlock: !FindInMap ['SubnetConfig', 'SubnetOne', 'CIDR']
+      MapPublicIpOnLaunch: true
+  SubnetTwo:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: {Ref: 'AWS::Region'}
+      VpcId: !Ref 'VPC'
+      CidrBlock: !FindInMap ['SubnetConfig', 'SubnetTwo', 'CIDR']
+      MapPublicIpOnLaunch: true
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachement:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref 'VPC'
+      InternetGatewayId: !Ref 'InternetGateway'
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref 'VPC'
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachement
+    Properties:
+      RouteTableId: !Ref 'PublicRouteTable'
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref 'InternetGateway'
+  PublicSubnetOneRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetOne
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetTwoRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref SubnetTwo
+      RouteTableId: !Ref PublicRouteTable
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                # Allow the ECS Tasks to download images from ECR
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+
+                # Allow the ECS tasks to upload logs to CloudWatch
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+              Resource: '*'
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: ecommerce
+      Tags:
+      - Key: Name
+        Value: GoPro Services
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Name: ProductTask
+          Image: 562292496929.dkr.ecr.us-west-2.amazonaws.com/product
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+      NetworkMode: awsvpc
+      Memory: 512
+      Cpu: 256
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref 'ECSTaskExecutionRole'
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: LBListener
+    Properties:
+      Cluster: ecommerce
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: 1
+      LaunchType: FARGATE
+      LoadBalancers:
+        - TargetGroupArn: !Ref 'TargetGroup'
+          ContainerName: ProductTask
+          ContainerPort: 8080
+      ServiceName: ProductService
+      SchedulingStrategy: REPLICA
+      TaskDefinition: !Ref 'TaskDefinition'
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref 'ECSServiceSecurityGroup'
+          Subnets:
+            - !Ref SubnetOne
+            - !Ref SubnetTwo
+  ECSServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: service-security
+      GroupDescription: security for ECS service to provide access to outside world.
+      VpcId: !Ref 'VPC'
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 20
+      HealthCheckPath: /
+      HealthCheckPort: 8080
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 15
+      HealthyThresholdCount: 2
+      Name: ProductTG
+      Port: 8080
+      Protocol: HTTP
+      Tags:
+        - Key: Name
+          Value: Product Target Group
+      TargetType: ip
+      VpcId: !Ref 'VPC'
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Name: ProductLB
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref 'LBServiceSecurityGroup'
+      Subnets:
+        - !Ref SubnetOne
+        - !Ref SubnetTwo
+      Tags:
+        - Key: Name
+          Value: ProductALB
+      Type: application
+  LBServiceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: LB-security
+      GroupDescription: security for LB opening the port 8080 for the outside world to access.
+      VpcId: !Ref 'VPC'
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: -1
+  LBListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'TargetGroup'
+          Type: forward
+      LoadBalancerArn: !Ref 'LoadBalancer'
+      Port: 8080
+      Protocol: HTTP
+  DBEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Open MySQL database for access
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '3306'
+        ToPort: '3306'
+        CidrIp: 0.0.0.0/0
+  MySQLDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: !Ref 'DBName'
+      AllocatedStorage: !Ref 'DBAllocatedStorage'
+      DBInstanceClass: !Ref 'DBInstanceClass'
+      DBInstanceIdentifier: inventory
+      Engine: MySQL
+      PubliclyAccessible: true
+      MasterUsername: !Ref 'DBUser'
+      MasterUserPassword: !Ref 'DBPassword'
+      Tags:
+      - Key: Name
+        Value: Inventory Database
+      VPCSecurityGroups: 
+      - !GetAtt DBEC2SecurityGroup.GroupId
+  OrderTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Name: OrderTask
+          Image: 562292496929.dkr.ecr.us-west-2.amazonaws.com/checkout
+          PortMappings:
+            - ContainerPort: 8082
+              Protocol: tcp
+      NetworkMode: awsvpc
+      Memory: 512
+      Cpu: 256
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref 'ECSTaskExecutionRole'
+  OrderECSService:
+    Type: AWS::ECS::Service
+    DependsOn: OrderLBListener
+    Properties:
+      Cluster: ecommerce
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: 1
+      LaunchType: FARGATE
+      LoadBalancers:
+        - TargetGroupArn: !Ref 'OrderTargetGroup'
+          ContainerName: OrderTask
+          ContainerPort: 8082
+      ServiceName: OrderService
+      SchedulingStrategy: REPLICA
+      TaskDefinition: !Ref 'OrderTaskDefinition'
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref 'ECSServiceSecurityGroup'
+          Subnets:
+            - !Ref SubnetOne
+            - !Ref SubnetTwo
+  OrderTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 20
+      HealthCheckPath: /
+      HealthCheckPort: 8082
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 15
+      HealthyThresholdCount: 2
+      Name: OrderTG
+      Port: 8082
+      Protocol: HTTP
+      Tags:
+        - Key: Name
+          Value: Order Target Group
+      TargetType: ip
+      VpcId: !Ref 'VPC'
+  OrderLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Name: OrderLB
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref 'LBServiceSecurityGroup'
+      Subnets:
+        - !Ref SubnetOne
+        - !Ref SubnetTwo
+      Tags:
+        - Key: Name
+          Value: OrdertALB
+      Type: application
+  OrderLBListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'OrderTargetGroup'
+          Type: forward
+      LoadBalancerArn: !Ref 'OrderLoadBalancer'
+      Port: 8082
+      Protocol: HTTP
+  DynamoDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions: 
+        - AttributeName: "userName"
+          AttributeType: "S"
+        - AttributeName: "date"
+          AttributeType: "S"
+      KeySchema: 
+        - AttributeName: "userName"
+          KeyType: "HASH"
+        - AttributeName: "date"
+          KeyType: "RANGE"
+      ProvisionedThroughput:
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      TableName: orders
+      Tags:
+        - Key: Name
+          Value: OrderDB
+  addtoCartTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Name: addtoCartTask
+          Image: 562292496929.dkr.ecr.us-west-2.amazonaws.com/cart
+          PortMappings:
+            - ContainerPort: 8081
+              Protocol: tcp
+      NetworkMode: awsvpc
+      Memory: 512
+      Cpu: 256
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref 'ECSTaskExecutionRole'
+  addtoCartECSService:
+    Type: AWS::ECS::Service
+    DependsOn: addtoCartLBListener
+    Properties:
+      Cluster: ecommerce
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: 1
+      LaunchType: FARGATE
+      LoadBalancers:
+        - TargetGroupArn: !Ref 'addtoCartTargetGroup'
+          ContainerName: addtoCartTask
+          ContainerPort: 8081
+      ServiceName: addtoCartService
+      SchedulingStrategy: REPLICA
+      TaskDefinition: !Ref 'addtoCartTaskDefinition'
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref 'ECSServiceSecurityGroup'
+          Subnets:
+            - !Ref SubnetOne
+            - !Ref SubnetTwo
+  addtoCartTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: true
+      HealthCheckIntervalSeconds: 20
+      HealthCheckPath: /
+      HealthCheckPort: 8081
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 15
+      HealthyThresholdCount: 2
+      Name: addtoCartTG
+      Port: 8081
+      Protocol: HTTP
+      Tags:
+        - Key: Name
+          Value: addtoCart Target Group
+      TargetType: ip
+      VpcId: !Ref 'VPC'
+  addtoCartLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Name: addtoCartLB
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref 'LBServiceSecurityGroup'
+      Subnets:
+        - !Ref SubnetOne
+        - !Ref SubnetTwo
+      Tags:
+        - Key: Name
+          Value: addtoCarttALB
+      Type: application
+  addtoCartLBListener:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref 'addtoCartTargetGroup'
+          Type: forward
+      LoadBalancerArn: !Ref 'addtoCartLoadBalancer'
+      Port: 8081
+      Protocol: HTTP
+  DBEC2PostgresSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Open Postgres database for access
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '5432'
+        ToPort: '5432'
+        CidrIp: 0.0.0.0/0
+  PostgresDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBName: cart
+      AllocatedStorage: !Ref 'DBAllocatedStorage'
+      DBInstanceClass: !Ref 'DBInstanceClass'
+      DBInstanceIdentifier: cartinstance
+      Engine: postgres
+      PubliclyAccessible: true
+      MasterUsername: !Ref 'DBUser'
+      MasterUserPassword: !Ref 'DBPassword'
+      Tags:
+      - Key: Name
+        Value: Cart Database
+      VPCSecurityGroups: 
+      - !GetAtt DBEC2PostgresSecurityGroup.GroupId
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: lambda-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+            - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+              - lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Path: /
+  ProductFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: lambda-product-function
+      Runtime: java8
+      Role:
+        Fn::GetAtt:
+          - LambdaRole
+          - Arn
+      Handler:  com.greatlearning.LambdaProduct.InvokeApplication::handleRequest
+      Code:
+        S3Bucket: productfunction
+        S3Key: LambdaProduct.jar
+      MemorySize: 256
+      Timeout: 60
+  ProductAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: InventoryAPI
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+  APIGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt "ProductAPI.RootResourceId"
+      PathPart: inventory
+      RestApiId: !Ref ProductAPI
+  APIGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ResourceId: !Ref APIGatewayResource
+      HttpMethod: GET
+      RestApiId: !Ref ProductAPI
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: GET
+        Type: AWS
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ProductFunction.Arn}/invocations"
+  APIGatewayDeployment:
+    Type: "AWS::ApiGateway::Deployment"
+    DependsOn:
+      - "APIGatewayMethod"
+    Properties:
+      RestApiId: !Ref "ProductAPI"
+      StageName: prod
+  lambdaApiGatewayInvoke:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      Action: "lambda:InvokeFunction"
+      FunctionName: !GetAtt "ProductFunction.Arn"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ProductAPI}/*/POST/"
+
+Outputs:
+  CartLBURL:
+    Description: add to cart microservice endpoint
+    Value: !Join 
+      - ''
+      - - 'http://'
+        - !GetAtt 
+          - addtoCartLoadBalancer
+          - DNSName
+  OrderLBURL:
+    Description: order microservice endpoint
+    Value: !Join 
+      - ''
+      - - 'http://'
+        - !GetAtt 
+          - OrderLoadBalancer
+          - DNSName
+  ProductLBURL:
+    Description: product microservice endpoint
+    Value: !Join 
+      - ''
+      - - 'http://'
+        - !GetAtt 
+          - LoadBalancer
+          - DNSName
+  PostgresEndpoint:
+    Description: Postgres JDBC Connection String.
+    Value: !Join ['', ['jdbc:postgresql://', !GetAtt [PostgresDB, Endpoint.Address], ':', !GetAtt [
+          PostgresDB, Endpoint.Port], /, 'cart']]
+  MySQLEndpoint:
+    Description: MYSQL JDBC Connection String.
+    Value: !Join ['', ['jdbc:mysql://', !GetAtt [MySQLDB, Endpoint.Address], ':', !GetAtt [
+          MySQLDB, Endpoint.Port], /, !Ref 'DBName']]
+  APIGatewayURL:
+    Value: !Sub "https://${ProductAPI}.execute-api.${AWS::Region}.amazonaws.com/prod"
